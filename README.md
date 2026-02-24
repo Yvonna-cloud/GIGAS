@@ -16,3 +16,5 @@ First, download the pre-trained model weights for the BLIP framework—specifica
   ```bash
   python attack_vqa.py --method gigas_attack
 
+
+## some codes are coming soon.
