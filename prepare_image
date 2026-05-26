@@ -1,3 +1,4 @@
+
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
@@ -41,7 +42,7 @@ import matplotlib.pyplot as plt
 import random
 from models.blip_itm import blip_itm
 
-declaration_file = '/data4/lyx/BLIP_VQA/___result/DPT/declaration/vqa/val2014_declarative.json'
+declaration_file = 'BLIP_VQA/___result/DPT/declaration/vqa/val2014_declarative.json'
 with open(declaration_file, 'r') as f:
     declarations = json.load(f)
 
@@ -92,7 +93,7 @@ class Adv_attack:
         self.mlm_model = BertForMaskedLM.from_pretrained(bert_path, config=config_atk).to(self.device) 
         self.bias_image_feat = None
 
-        self.text_to_image = DiffusionPipeline.from_pretrained("/data4/lyx/MODEL/stable-diffusion-xl-refiner-1.0", 
+        self.text_to_image = DiffusionPipeline.from_pretrained("MODEL/stable-diffusion-xl-refiner-1.0", 
                                                                torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
         self.text_to_image.to(self.device)
         self.itm_model = itm_model
