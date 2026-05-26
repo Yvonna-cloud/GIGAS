@@ -1,0 +1,423 @@
+import numpy as np
+import tensorflow as tf
+import tensorflow_hub as hub
+import sys
+from transformers import BertForMaskedLM, BertTokenizer
+from transformers.models.bert.modeling_bert import BertConfig#, BertEmbeddings
+bert_path = 'bert-base-uncased'
+config_atk = BertConfig.from_pretrained(bert_path)
+import copy
+import torch
+import torch.nn
+import utils
+import torch.optim
+from filter_words import filter_words
+import nltk
+from nltk.corpus import stopwords
+
+
+nltk.download('stopwords')
+from nltk.corpus import stopwords
+filter_words = filter_words + stopwords.words('english')+['?','.']
+class Feature(object):
+    def __init__(self, seq_a):
+        # self.label = label
+        self.seq = seq_a
+        self.final_adverse = seq_a
+        self.query = 0
+        self.change = 0
+        self.success = 0
+        self.sim = 0.0
+        self.changes = []
+import json
+import cleverhans.torch.attacks.BLIP.projected_gradient_descent as pgd
+from torchvision.transforms import Resize
+from torchvision import transforms
+
+from diffusers import DiffusionPipeline
+import torch
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import random
+from models.blip_itm import blip_itm
+
+declaration_file = '/data4/lyx/BLIP_VQA/___result/DPT/declaration/vqa/val2014_declarative.json'
+with open(declaration_file, 'r') as f:
+    declarations = json.load(f)
+
+from torchvision.transforms.functional import InterpolationMode
+normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5,0.5,0.5))
+transform = transforms.Compose([
+    transforms.Resize((480,480),interpolation=InterpolationMode.BICUBIC),
+    transforms.ToTensor(),
+    normalize,
+    ])  
+
+# How many sampling steps to take
+num_inference_steps = 300 # @param {type:"integer"}
+# To avoid numerical underflow, scale loss by this amount and then divide gradients after backprop
+sg_loss_rescale = 1000. # @param {type: "number"}
+# Weight on self guidance term in sampling
+sg_grad_wt = 1000. # @param {type: "number"}
+# Step # to start self guidance.
+sg_t_start = 20 # @param {type:"integer"}
+# Step # to end self guidance.
+sg_t_end = 280 # @param {type:"integer"}
+
+import os
+class Adv_attack:
+    def __init__(self, vqa_model,pretrain_model,tokenizer,device,correct_idx_list,correct_pred_list,USE_model,itm_model,exp_file):
+        self.attack_dict = {}
+        self.acc_list=[]
+        self.tokenizer = tokenizer
+        self.single_stg_step=20
+        self.total_stg_step=40
+        self.tokenizer_mlm = BertTokenizer.from_pretrained(bert_path,
+                                                           do_lower_case="uncased" in bert_path)
+        self.text_bank={}
+        self.adv_txt_dict = {}
+        self.cos_sim=0.95
+        self.k=10
+        self.text_budget = 100000
+        self.correct_list = correct_idx_list
+        self.blip_ans_table = correct_pred_list
+        self.white_model=pretrain_model
+        self.black_model=vqa_model
+        self.USE_model=USE_model
+        self.device=device
+        self.batch=None
+        self.captions=None
+        self.vqa_score=0
+        self.acc_list=[]
+        self.mlm_model = BertForMaskedLM.from_pretrained(bert_path, config=config_atk).to(self.device) 
+        self.bias_image_feat = None
+
+        self.text_to_image = DiffusionPipeline.from_pretrained("/data4/lyx/MODEL/stable-diffusion-xl-refiner-1.0", 
+                                                               torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+        self.text_to_image.to(self.device)
+        self.itm_model = itm_model
+        self.itm_model.eval()
+        self.itm_model.to(self.device)
+        self.top_k=20
+        self.unpair_rate = 0.5
+        self.exp_file=exp_file
+        
+    def itm_task(self,image,caption):
+        itm_output = self.itm_model(image,caption,match_head='itm')
+        itm_score = torch.nn.functional.softmax(itm_output,dim=1)[:,1]
+        return itm_score
+
+    def black_box_predict(self,image,text):
+        answer_ids, topk_ids, topk_probs, = self.black_model(image, text,
+                                                             self.answer_candidates, train=False,
+                                                             inference='rank',
+                                                             k_test=128)
+        out_v = []
+        for  answer_id in answer_ids:
+            out_v.append({"answer": self.answer_list[answer_id]})
+        return out_v[0]['answer']
+
+    def save_contrast(self, bias_images, bias_answer, contrast_path):
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(contrast_path), exist_ok=True)
+
+        # Load the images
+        left_image = self.batch['image'].to(self.device)
+        left_image = (left_image + 1) / 2
+        right_image = (bias_images + 1) /2
+        left_image = left_image.detach().squeeze().cpu()
+        left_image = np.clip(left_image, 0, 1)
+        left_image = np.transpose(left_image, (1, 2, 0))
+        right_image = right_image.detach().squeeze().cpu()  
+        right_image = np.clip(right_image, 0, 1)
+        right_image = np.transpose(right_image, (1, 2, 0))
+
+        # Create a figure and axes
+        fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+
+        # Plot left image
+        axs[0].imshow(left_image)
+        axs[0].set_title('Original Image')
+        axs[0].axis('off')
+
+        # Plot right image
+        axs[1].imshow(right_image)
+        axs[1].set_title('Bias Image')
+        axs[1].axis('off')
+
+        # Add text to the figure
+        question_text = str(self.batch['question'][0])
+        bias_text = "wrong_answer:",bias_answer
+        gth_answer = "gth_answer:" + self.blip_ans_table[str(int(self.batch['question_id'][0]))]
+
+        # Add text below the images
+        fig.text(0.5, 0.07, question_text, ha='center')
+        fig.text(0.5, 0.04, bias_text, ha='center')
+        fig.text(0.5, 0.01, gth_answer, ha='center')
+
+        # Save the figure
+        plt.savefig(contrast_path)
+        plt.close(fig)
+
+    def generate_bias_image(self,bias_path, contrast_base_path):
+        question_id = str(int(self.batch['question_id'][0]))
+        question = str(self.batch['question'][0])
+        gth_answer = self.blip_ans_table[question_id]
+        ori_image = copy.deepcopy(self.batch['image']).to(self.device)
+        prompt = self.generate_prompt(ori_image)
+        for iter in range(self.top_k):
+            bias_images = self.text_to_image(prompt[iter][0], image=ori_image).images
+            bias_image = bias_images[0]
+            bias_image_tensor = transform(bias_image).unsqueeze(0).to(self.device)
+            pred_ans = self.black_box_predict(bias_image_tensor, question)
+
+            if pred_ans != gth_answer:
+                break
+        diff = bias_image_tensor - ori_image
+        l2_norm = torch.norm(diff, p=2) 
+        save_bias(bias_image, bias_path)
+
+        contrast_path = f"{contrast_base_path}/{self.batch['question_id'][0].cpu().numpy()}.png"
+        self.save_contrast(bias_image_tensor, pred_ans, contrast_path)
+        return bias_image , pred_ans ,l2_norm
+
+    def mlm_task(self,masked_text,image_feature,question,gth_answer):
+        context_masked_text = question + masked_text 
+        inputs = self.tokenizer_mlm(context_masked_text, return_tensors='pt')
+        input_ids = inputs['input_ids'].to(self.device)
+        mask_token_index = torch.where(input_ids == self.tokenizer_mlm.mask_token_id)[1]
+        ori_sentence = masked_text.replace(self.tokenizer_mlm.mask_token, gth_answer, 1)
+        ori_pair = self.itm_task(image_feature,ori_sentence)
+
+        if mask_token_index.numel() == 0:
+            return [masked_text for _ in range(self.top_k)]
+
+        # 预测遮掩的词
+        with torch.no_grad():
+            outputs = self.mlm_model(input_ids=input_ids)
+
+        # 获取 mask token 的预测分数
+        mask_token_logits = outputs.logits[0, mask_token_index, :]
+        top_k_token_indices = torch.topk(mask_token_logits, 10000, dim=1).indices[0].tolist()
+        predicted_tokens = [self.tokenizer_mlm.decode([token_id]).strip() for token_id in top_k_token_indices]
+        confidence_scores = torch.softmax(mask_token_logits, dim=1)[0, top_k_token_indices].tolist()
+        ori_sentence = masked_text.replace(self.tokenizer_mlm.mask_token, gth_answer, 1)
+        ori_pair = self.itm_task(image_feature,ori_sentence)
+
+        # 构建替换后的句子及其置信度
+        sentence = []
+        for token, confidence in zip(predicted_tokens, confidence_scores):
+            if len(sentence) == self.top_k:
+                break
+            # 生成替换后的句子
+            new_sentence = masked_text.replace(self.tokenizer_mlm.mask_token, token, 1)
+            # 排除空字符串和相同的gth_answer
+            if token.strip() and token != gth_answer:
+                pair_rate = self.itm_task(image_feature,new_sentence)
+                if pair_rate/ori_pair < self.unpair_rate:
+                    sentence.append((new_sentence, confidence,pair_rate,token))
+
+        # 按置信度排序
+        sentence.sort(key=lambda x: x[2])
+        if len(sentence) < self.top_k:
+            last_candidate = sentence[-1] if sentence else masked_text
+            sentence.extend([last_candidate] * (self.top_k - len(sentence)))
+        return sentence
+
+    def generate_prompt(self,image_feature):
+        question_id = str(int(self.batch['question_id'][0]))
+        question = str(self.batch['question'][0])
+        gth_answer = self.blip_ans_table[question_id]
+        masked_text = declarations[question_id]
+        label = get_type(question,gth_answer)
+        if label == 0 :
+                masked_text = masked_text.replace('[MASK]', 'no', 1)
+                masked_text = ensure_not_after_be(masked_text)
+                masked_text = masked_text + ' ' + "but [MASK] ."
+        elif label == 3:
+            masked_text = masked_text.replace('[MASK]', 'yes', 1)
+            masked_text = masked_text + ' ' + "but [MASK] ."
+        elif label == 1:
+            masked_text = masked_text.replace('[MASK]', 'no', 1)
+            masked_text = masked_text + ' ' + "but [MASK] ."
+        elif label == 4 and not gth_answer.strip().lower().startswith('yes'):
+            while "[MASK]" in masked_text:
+                masked_text = self.mlm_task(masked_text,image_feature,question,gth_answer)
+            masked_text = "Because of [MASK] ," + masked_text[0][0]
+        new_text = self.mlm_task(masked_text,image_feature,question,gth_answer)
+        return new_text
+    
+
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        data_loader,
+        tokenizer
+    ):
+        answer_list = data_loader.dataset.answer_list
+        self.answer_list=answer_list
+        answer_candidates = self.black_model.tokenizer(answer_list, padding='longest', return_tensors='pt').to(self.device)
+        self.answer_candidates=answer_candidates
+        answer_candidates.input_ids[:, 0] = self.black_model.tokenizer.bos_token_id
+        self.tokeizer=tokenizer
+        self.white_model.eval()
+        self.black_model.eval()
+        bias_root = self.exp_file + "/bias_image_top" + str(self.top_k)
+        os.makedirs(os.path.dirname(bias_root), exist_ok=True)
+        contrast_path = self.exp_file + "/contrast_image_top" + str(self.top_k) 
+
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        header = "Test:"
+        print_freq=100
+        L2=0
+        success0 = 0
+        success1 = 0
+        success2 = 0
+        success3 = 0
+        success4 = 0
+        fail0 = 0
+        fail1 = 0
+        fail2 = 0
+        fail3 = 0
+        fail4 = 0
+        for i, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+            if len(self.acc_list)>=5000:
+                break
+            if int(batch['question_id'][0]) not in self.correct_list:
+                continue
+            ori_img = batch['image'].to(self.device, non_blocking=True)
+            pred_ans = self.black_box_predict(ori_img,batch['question'][0])
+            self.batch = copy.deepcopy(batch)
+            ret = dict()
+            ret['preds'] = [self.blip_ans_table[str(int(batch['question_id'][0]))]]
+            if pred_ans!=ret['preds'][0]:
+                print('wrong answer here',pred_ans,ret['preds'][0])
+                continue
+            q_id = self.batch['question_id'][0].cpu().numpy()
+            bias_path = bias_root + '/'+ str(q_id) + '.png'
+            bias_image,out_v_ans,l2 = self.generate_bias_image(bias_path,contrast_path)
+
+            L2+=l2
+            label = get_type(batch['question'][0],pred_ans)
+            if out_v_ans == pred_ans:
+                flag=0
+            else:
+                flag=1
+
+            if label ==0 and flag ==0:
+                fail0 += 1
+            elif label ==0 and flag ==1:
+                success0 += 1
+            elif label ==1 and flag ==0:
+                fail1 += 1
+            elif label ==1 and flag ==1:
+                success1 += 1
+            elif label ==2 and flag ==0:
+                fail2 += 1
+            elif label ==2 and flag ==1:
+                success2 += 1
+            elif label ==3 and flag ==0:
+                fail3 += 1
+            elif label ==3 and flag ==1:
+                success3 += 1
+            elif label ==4 and flag ==0:
+                fail4 += 1
+            elif label ==4 and flag ==1:
+                success4 += 1
+            
+            if out_v_ans!=self.blip_ans_table[str(int(batch['question_id'][0]))]:
+                self.acc_list.append(torch.tensor(1,device=self.device))
+            else:
+                self.acc_list.append(torch.tensor(0,device=self.device))
+
+
+        print(f'change of {str(len(self.acc_list))} samples:', sum(self.acc_list) / len(self.acc_list), flush=True)
+        print("L2:",L2/ len(self.acc_list))
+        print("fail0:",fail0/5000)
+        print("fail1:",fail1/5000)
+        print("fail2:",fail2/5000)
+        print("fail3:",fail3/5000)
+        print("fail4:",fail4/5000)
+        print("success0:",success0/5000)
+        print("success1:",success1/5000)
+        print("success2:",success2/5000)
+        print("success3:",success3/5000)
+        print("success4:",success4/5000)
+
+
+        print("Bias image generated!")
+
+from PIL import Image
+import torch  
+
+def save_bias(bias_image, bias_path):
+    if os.path.isfile(bias_path):
+        os.remove(bias_path)
+    bias_image.save(bias_path)
+
+def convert_ndarray_to_list(obj):
+    """
+    递归地将字典或列表中的 NumPy 数组转换为 Python 列表。
+    """
+    if isinstance(obj, dict):
+        return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_ndarray_to_list(elem) for elem in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
+    
+def get_type(q,ans):
+    q = q.strip().lower()  # 去除前后空格并转换为小写
+    ans = ans.strip().lower()
+    if ans.startswith('yes'):
+        return 0
+    elif ans.startswith('no'):
+        return 3
+    elif q.startswith('how many'):
+        return 1
+    elif q.startswith('why'):
+        return 4
+    else:
+        return 2
+
+def ensure_not_after_be(text):
+    """
+    检索字符串中的 '[BE]'和'[DO]'，判断后面是否是 ' not '，如果不是则添加 ' not '。
+    """
+    be_token = '[BE]'
+    do_token = '[DO]'
+    not_token = ' not'
+    
+    # 用来存放处理后的文本
+    result_text = ""
+    index = 0
+    
+    while index < len(text):
+        # 查找 '[BE]' 和 '[DO]' 的位置
+        be_index = text.find(be_token, index)
+        do_index = text.find(do_token, index)
+
+        # 如果都找不到，退出循环
+        if be_index == -1 and do_index == -1:
+            result_text += text[index:]
+            break
+
+        # 选择最近的标记
+        if be_index != -1 and (do_index == -1 or be_index < do_index):
+            # 添加 '[BE]' 之前的文本到结果中
+            result_text += text[index:be_index + len(be_token)]
+            index = be_index + len(be_token)
+            if not text[index:].startswith(not_token):
+                result_text += not_token
+        elif do_index != -1:
+            # 添加 '[DO]' 之前的文本到结果中
+            result_text += text[index:do_index + len(do_token)]
+            index = do_index + len(do_token)
+            if not text[index:].startswith(not_token):
+                result_text += not_token
+    
+    return result_text
+
